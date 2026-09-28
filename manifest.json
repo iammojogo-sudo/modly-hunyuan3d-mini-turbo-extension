@@ -2,7 +2,7 @@
   "id": "hunyuan3d-mini-turbo",
   "name": "Hunyuan3D 2 Mini Turbo",
   "type": "model",
-  "source": "https://github.com/iammojogo-sudo/modly-hunyuan3d-mini-turbo-extension",
+  "source": "https://github.com/lightningpixel/modly-hunyuan3d-mini-turbo-extension",
   "description": "Ultra-fast turbo variant of Hunyuan3D 2 Mini. High-quality results in 1–5 steps.",
   "version": "1.0.0",
   "author": "Lightning Pixel",

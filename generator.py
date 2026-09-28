@@ -103,11 +103,29 @@ class Hunyuan3DMiniTurboGenerator(BaseGenerator):
             yield
 
         try:
+            torch.backends.cuda._modly_sdp_original = torch.backends.cuda.sdp_kernel
             torch.backends.cuda.sdp_kernel = _sdpa_kernel
             torch.backends.cuda._modly_sdp_patched = True
             print("[Hunyuan3DMiniTurboGenerator] Relaxed sdp_kernel for non-CUDA device.")
         except Exception as exc:
             print(f"[Hunyuan3DMiniTurboGenerator] Could not relax sdp_kernel: {exc}")
+
+    @staticmethod
+    def _unpatch_sdp_backend() -> None:
+        """Restore `torch.backends.cuda.sdp_kernel` if this generator patched it.
+
+        Scopes the patch to this generator's loaded lifetime so it doesn't
+        silently neuter kernel selection for other CUDA models running in the
+        same process after this generator unloads.
+        """
+        import torch
+
+        original = getattr(torch.backends.cuda, "_modly_sdp_original", None)
+        if original is not None:
+            torch.backends.cuda.sdp_kernel = original
+            del torch.backends.cuda._modly_sdp_original
+        if getattr(torch.backends.cuda, "_modly_sdp_patched", False):
+            torch.backends.cuda._modly_sdp_patched = False
 
     def _enable_flashvdm(self, pipeline, device: str, dtype) -> None:
         """Enable FlashVDM: the adaptive-KV volume decoder used by the turbo model.
@@ -144,6 +162,7 @@ class Hunyuan3DMiniTurboGenerator(BaseGenerator):
         super().unload()
         try:
             import torch
+            self._unpatch_sdp_backend()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             elif torch.backends.mps.is_available():
@@ -247,7 +266,7 @@ class Hunyuan3DMiniTurboGenerator(BaseGenerator):
     def _run_texture(self, mesh, image: "Image.Image", progress_cb=None):
         import torch
 
-        if getattr(self, "_device", None) and self._device != "cuda":
+        if getattr(self, "_device", None) != "cuda":
             raise RuntimeError(
                 "Texture generation requires an NVIDIA GPU: the custom rasterizer / "
                 "differentiable renderer have no Metal (MPS) or CPU implementation. "
