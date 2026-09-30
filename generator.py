@@ -30,7 +30,6 @@ from services.generators.base import (
 
 _HF_REPO_ID      = "tencent/Hunyuan3D-2mini"
 _SUBFOLDER       = "hunyuan3d-dit-v2-mini-turbo"
-_TURBO_VAE       = "hunyuan3d-vae-v2-mini-turbo"
 _GITHUB_ZIP      = "https://github.com/Tencent/Hunyuan3D-2/archive/refs/heads/main.zip"
 _PAINT_HF_REPO   = "tencent/Hunyuan3D-2"
 _PAINT_SUBFOLDER = "hunyuan3d-paint-v2-0-turbo"
@@ -59,10 +58,16 @@ class Hunyuan3DMiniTurboGenerator(BaseGenerator):
 
         self._ensure_hy3dgen()
 
+        import torch
         from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
 
         device = select_device()
         dtype  = select_dtype(device)
+        if device == "mps":
+            # select_dtype() picks fp32 on MPS for broad op coverage, but this
+            # pipeline runs fine in fp16 there (verified on torch 2.14): ~3x
+            # faster diffusion and half the memory.
+            dtype = torch.float16
         self._device = device
 
         self._patch_sdp_backend_for_non_cuda(device)
@@ -80,7 +85,7 @@ class Hunyuan3DMiniTurboGenerator(BaseGenerator):
         self._enable_flashvdm(pipeline, device, dtype)
 
         self._model = pipeline
-        print(f"[Hunyuan3DMiniTurboGenerator] Loaded on {device}.")
+        print(f"[Hunyuan3DMiniTurboGenerator] Loaded on {device} ({dtype}).")
 
     @staticmethod
     def _patch_sdp_backend_for_non_cuda(device: str) -> None:
@@ -130,24 +135,15 @@ class Hunyuan3DMiniTurboGenerator(BaseGenerator):
     def _enable_flashvdm(self, pipeline, device: str, dtype) -> None:
         """Enable FlashVDM: the adaptive-KV volume decoder used by the turbo model.
 
-        The turbo checkpoint embeds the standard mini VAE, so the dedicated
-        turbo VAE is swapped in before enabling the decoder. Surface extraction
+        FlashVDM is enabled on the VAE embedded in the turbo checkpoint. The
+        dedicated turbo VAE (hunyuan3d-vae-v2-mini-turbo) is deliberately NOT
+        swapped in: its latent_shape is 512 tokens instead of the DiT's 3072,
+        and the pipeline sizes the diffusion noise from the VAE, so the swap
+        silently changes (degrades) the generated shape. Surface extraction
         uses marching cubes ('mc'); the DMC extractor depends on the CUDA-only
         `diso` package and has no Metal (MPS) or CPU backend.
         """
         try:
-            from hy3dgen.shapegen.models import ShapeVAE
-
-            vae_dir = self.model_dir / _TURBO_VAE
-            if vae_dir.exists():
-                pipeline.vae = ShapeVAE.from_pretrained(
-                    str(self.model_dir),
-                    subfolder=_TURBO_VAE,
-                    use_safetensors=True,
-                    device=device,
-                    dtype=dtype,
-                )
-
             pipeline.vae.enable_flashvdm_decoder(
                 enabled=True,
                 adaptive_kv_selection=True,
@@ -157,6 +153,23 @@ class Hunyuan3DMiniTurboGenerator(BaseGenerator):
             print("[Hunyuan3DMiniTurboGenerator] FlashVDM decoder enabled (mc surface extraction).")
         except Exception as exc:
             print(f"[Hunyuan3DMiniTurboGenerator] FlashVDM unavailable ({exc}); using vanilla decoder.")
+            return
+
+        if device == "mps":
+            # MPS executes asynchronously: the decode loop enqueues every chunk
+            # before the GPU finishes any, and each chunk's attention buffers
+            # stay allocated until then (41 GB peak at octree 512). Syncing
+            # after each chunk caps the peak (~14 GB) at no speed cost.
+            import torch
+            geo_decoder = pipeline.vae.geo_decoder
+            forward = geo_decoder.forward
+
+            def synced_forward(*args, **kwargs):
+                out = forward(*args, **kwargs)
+                torch.mps.synchronize()
+                return out
+
+            geo_decoder.forward = synced_forward
 
     def unload(self) -> None:
         super().unload()
@@ -215,7 +228,7 @@ class Hunyuan3DMiniTurboGenerator(BaseGenerator):
                     num_inference_steps=num_steps,
                     octree_resolution=octree_res,
                     guidance_scale=guidance_scale,
-                    num_chunks=4000,
+                    num_chunks=8000,
                     generator=generator,
                     output_type="trimesh",
                 )
